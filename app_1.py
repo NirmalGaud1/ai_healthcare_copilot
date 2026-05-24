@@ -15,7 +15,6 @@ from sklearn.impute import SimpleImputer
 
 warnings.filterwarnings('ignore')
 
-# ====================== MODEL COMPONENTS ======================
 def dfig_gate(X, gate_weights):
     gates = 1.0 / (1.0 + np.exp(-np.abs(X) * gate_weights))
     gated = gates * X
@@ -44,7 +43,6 @@ def build_enriched_features(X_disease, gate_weights, age_col_idx=None,
         tre = temporal_risk_encoding(X_disease[:, age_col_idx], hidden_dim=tre_dim)
     else:
         tre = np.zeros((len(X_disease), tre_dim))
-    
     if disease_name == 'cvd':
         interact = np.column_stack([
             X_disease[:, 0] * X_disease[:, 4],
@@ -71,11 +69,27 @@ def build_enriched_features(X_disease, gate_weights, age_col_idx=None,
         ])
     else:
         interact = X_disease[:, :5] * X_disease[:, 1:6]
-    
     enriched = np.hstack([gated, tre, interact])
     return enriched, gates
 
-# ====================== CLASSES ======================
+class CRSLMonitor:
+    @staticmethod
+    def compute(X_enriched, y_labels, margin=1.0, sample_n=500):
+        np.random.seed(42)
+        idx = np.random.choice(len(X_enriched), min(sample_n, len(X_enriched)), replace=False)
+        X_sub = X_enriched[idx]
+        y_sub = y_labels[idx]
+        norms = np.linalg.norm(X_sub, axis=1, keepdims=True).clip(1e-8)
+        X_norm = X_sub / norms
+        sim = X_norm @ X_norm.T
+        same = y_sub[:, None] == y_sub[None, :]
+        np.fill_diagonal(same, False)
+        diff = ~same.copy()
+        np.fill_diagonal(diff, False)
+        sim_same = sim[same].mean() if same.any() else 0.0
+        sim_diff = sim[diff].mean() if diff.any() else 0.0
+        return sim_same, sim_diff, sim_same - sim_diff
+
 class MDRSNetPerDisease:
     def __init__(self, disease_name, feature_names, display_names=None,
                  hidden=(128, 64), alpha=1e-2, tre_dim=24):
@@ -143,7 +157,27 @@ class MDRSNetPerDisease:
         display = [self.display_names.get(f, f) for f in self.feature_names]
         return scores, gate_p, display
 
-# ====================== STREAMLIT APP ======================
+class MDRSNetCopilot:
+    DISEASE_KEYS = ['cvd', 'dm', 'copd']
+
+    def __init__(self):
+        self.models = {}
+
+    def assess_patient(self, x_cvd, x_dm, x_copd):
+        probs = {}
+        for key, x in zip(self.DISEASE_KEYS, [x_cvd, x_dm, x_copd]):
+            p, _ = self.models[key].predict_proba(x.reshape(1, -1))
+            probs[key] = float(p[0])
+        tiers = {}
+        for key, p in probs.items():
+            if p > 0.70:
+                tiers[key] = 'HIGH'
+            elif p > 0.40:
+                tiers[key] = 'MEDIUM'
+            else:
+                tiers[key] = 'LOW'
+        return probs, tiers
+
 st.set_page_config(
     page_title="Healthcare AI Co-pilot | MDRS-Net",
     page_icon="🏥",
@@ -164,19 +198,26 @@ st.markdown("""
 .risk-MEDIUM { border-color: #ffa500; background: #2d1f00; }
 .risk-LOW { border-color: #44ff88; background: #0f2d1a; }
 .section-title { font-size: 1.15rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.4rem; }
+.stButton > button {
+    background: #238636; color: white; border-radius: 8px;
+    border: none; font-weight: 600; font-size: 1rem; padding: 0.55rem 1.8rem;
+}
+.stButton > button:hover { background: #2ea043; }
+footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-# === FIXED MODEL PATH ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = BASE_DIR  # Models are in root, not in 'models/' folder
+MODEL_DIR = BASE_DIR
 
 RISK_COLORS = {"HIGH": "#ff4444", "MEDIUM": "#ffa500", "LOW": "#44ff88"}
 RISK_EMOJIS = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
 
 def risk_tier(prob):
-    if prob > 0.70: return "HIGH"
-    if prob > 0.40: return "MEDIUM"
+    if prob > 0.70:
+        return "HIGH"
+    if prob > 0.40:
+        return "MEDIUM"
     return "LOW"
 
 def render_risk_card(disease, prob, tier, col):
@@ -187,45 +228,113 @@ def render_risk_card(disease, prob, tier, col):
         f'<div style="font-size:1rem;color:{RISK_COLORS[tier]};">{RISK_EMOJIS[tier]} {tier} RISK</div>'
         '</div>', unsafe_allow_html=True)
 
+def plot_gauge(prob, label, color):
+    fig, ax = plt.subplots(figsize=(3.2, 2.0), subplot_kw=dict(aspect='equal'))
+    fig.patch.set_alpha(0)
+    ax.set_facecolor('none')
+    theta = np.linspace(np.pi, 0, 200)
+    ax.plot(np.cos(theta), np.sin(theta), color='#30363d', lw=12, solid_capstyle='round')
+    end = max(1, int(prob * 200))
+    ax.plot(np.cos(theta[:end]), np.sin(theta[:end]), color=color, lw=12, solid_capstyle='round')
+    ax.text(0, -0.35, f"{prob*100:.1f}%", ha='center', va='center',
+            fontsize=15, fontweight='bold', color=color)
+    ax.text(0, -0.65, label, ha='center', va='center', fontsize=8, color='#8b949e')
+    ax.set_xlim(-1.2, 1.2)
+    ax.set_ylim(-0.8, 1.2)
+    ax.axis('off')
+    plt.tight_layout(pad=0.2)
+    return fig
+
+def plot_ggga_bars(scores, feat_names, title, top_n=10):
+    idx = np.argsort(np.abs(scores))[-top_n:][::-1]
+    vals = scores[idx]
+    names = [feat_names[i][:22] for i in idx]
+    colors = ['#ff4444' if v > 0 else '#4ecdc4' for v in vals]
+    fig, ax = plt.subplots(figsize=(6, max(3, len(idx) * 0.45)))
+    fig.patch.set_facecolor('#161b22')
+    ax.set_facecolor('#161b22')
+    ax.barh(range(len(vals))[::-1], vals, color=colors, alpha=0.85)
+    ax.set_yticks(range(len(names))[::-1])
+    ax.set_yticklabels(names, color='#e6edf3', fontsize=9)
+    ax.axvline(0, color='#8b949e', lw=0.8, linestyle='--')
+    ax.set_xlabel('GGGA Attribution Score', color='#8b949e', fontsize=9)
+    ax.set_title(title, color='#e6edf3', fontsize=11, fontweight='bold')
+    ax.tick_params(colors='#8b949e')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#30363d')
+    plt.tight_layout()
+    return fig
+
+def plot_gate_weights(gate_weights, feat_names, display_names, title, top_n=12):
+    idx = np.argsort(gate_weights)[-top_n:]
+    vals = gate_weights[idx]
+    names = [display_names.get(feat_names[i], feat_names[i])[:20] for i in idx]
+    norm = vals / vals.max() if vals.max() > 0 else vals
+    fig, ax = plt.subplots(figsize=(6, max(3, len(idx) * 0.42)))
+    fig.patch.set_facecolor('#161b22')
+    ax.set_facecolor('#161b22')
+    ax.barh(range(len(vals)), vals, color=plt.cm.YlOrRd(norm), alpha=0.88)
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names, color='#e6edf3', fontsize=9)
+    ax.set_xlabel('Gate Weight', color='#8b949e', fontsize=9)
+    ax.set_title(title, color='#e6edf3', fontsize=11, fontweight='bold')
+    ax.tick_params(colors='#8b949e')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#30363d')
+    plt.tight_layout()
+    return fig
+
 @st.cache_resource(show_spinner="Loading MDRS-Net models...")
 def load_models():
-    meta_path = os.path.join(BASE_DIR, "copilot_meta.json")
-    
+    meta_path = os.path.join(MODEL_DIR, "copilot_meta.json")
     if not os.path.exists(meta_path):
-        st.error("❌ `copilot_meta.json` not found in root directory.")
-        st.info(f"Files found: {os.listdir(BASE_DIR)}")
-        return None, None, "NOT_FOUND", os.listdir(BASE_DIR)
-    
+        files_here = os.listdir(MODEL_DIR) if os.path.isdir(MODEL_DIR) else []
+        return None, None, "NOT_FOUND", files_here
     with open(meta_path) as f:
         meta = json.load(f)
-    
     models = {}
     for key in ["cvd", "dm", "copd"]:
-        pkl_path = os.path.join(BASE_DIR, f"mdrsnet_{key}.pkl")
+        pkl_path = os.path.join(MODEL_DIR, f"mdrsnet_{key}.pkl")
         if not os.path.exists(pkl_path):
-            st.error(f"❌ `mdrsnet_{key}.pkl` not found!")
-            return None, None, f"MISSING_{key}", []
-        
+            return None, None, "MISSING_" + key, []
         with open(pkl_path, "rb") as f:
             models[key] = pickle.load(f)
-    
     return models, meta, "OK", []
 
-# ====================== SIDEBAR ======================
 with st.sidebar:
     st.markdown("## 🏥 Healthcare AI Co-pilot")
     st.markdown("**MDRS-Net** — Multi-Disease Risk Stratification")
     st.markdown("---")
     page = st.radio("Navigation", [
-        "🏠 Home", "🔬 Patient Risk Assessment",
-        "🧠 XAI — Feature Attribution", "📊 Model Performance", "ℹ️ About"
+        "🏠 Home",
+        "🔬 Patient Risk Assessment",
+        "🧠 XAI — Feature Attribution",
+        "📊 Model Performance",
+        "ℹ️ About",
     ], label_visibility="collapsed")
+    st.markdown("---")
+    st.markdown("**Novel Components**")
+    st.markdown("- 🔵 DFIG — Dynamic Feature Gate")
+    st.markdown("- 🟣 TRE — Temporal Risk Encoder")
+    st.markdown("- 🟠 CRSL — Contrastive Loss Monitor")
+    st.markdown("- 🟢 GGGA — Gate-Guided Attribution")
+    st.markdown("---")
+    st.caption("Datasets: Heart Disease · Diabetes BRFSS 2015 · COPD Dataset")
 
 models, meta, status, files_found = load_models()
 
 if status != "OK":
+    if status == "NOT_FOUND":
+        st.error("copilot_meta.json not found in repo root.")
+        st.markdown("App is searching in: " + MODEL_DIR)
+        st.markdown("Files found: " + str(files_found))
+    else:
+        missing_key = status.replace("MISSING_", "")
+        st.error("mdrsnet_" + missing_key + ".pkl not found in repo root.")
+    st.markdown("---")
+    st.markdown("Make sure these 5 files are uploaded directly to the root of your GitHub repo:")
+    st.code("mdrsnet_cvd.pkl\nmdrsnet_dm.pkl\nmdrsnet_copd.pkl\ncopilot_meta.json\nbest_model_report.csv")
     st.stop()
-
 
 if page == "🏠 Home":
     st.title("Healthcare AI Co-pilot")
@@ -257,7 +366,7 @@ if page == "🏠 Home":
         ("📥 Input", "Structured clinical data\n(labs, vitals, history)"),
         ("🔵 DFIG", "Dynamic Feature\nImportance Gate"),
         ("🟣 TRE", "Temporal Risk\nEncoder (age-aware)"),
-        ("🤖 MLP", "128→64 hidden layers\nEarly stopping, Adam"),
+        ("🤖 MLP", "128 to 64 hidden layers\nEarly stopping, Adam"),
     ]
     for col, (title, desc) in zip(arch_cols, arch_data):
         col.markdown(
@@ -390,7 +499,6 @@ elif page == "🔬 Patient Risk Assessment":
         if not high_risks and not med_risks:
             st.success("LOW RISK across all disease domains. Maintain regular check-ups.")
         st.info("This AI-assisted prognosis is for clinical decision support only. Final diagnosis must be made by a qualified healthcare professional.")
-
         st.session_state["last_inputs"] = {"cvd": x_cvd, "dm": x_dm, "copd": x_copd}
         st.session_state["last_results"] = results
 
@@ -398,26 +506,20 @@ elif page == "🧠 XAI — Feature Attribution":
     st.title("🧠 Explainable AI — GGGA Feature Attribution")
     st.markdown("Gate-Guided Gradient Attribution (GGGA) computes per-patient feature importance.")
     st.markdown("Red bars increase risk. Teal bars decrease risk.")
-
     if "last_inputs" not in st.session_state:
         st.warning("Run a Patient Risk Assessment first to enable XAI explanations.")
         st.stop()
-
     inputs = st.session_state["last_inputs"]
     results = st.session_state["last_results"]
-
     disease_sel = st.selectbox("Select Disease Model to Explain", ["cvd", "dm", "copd"],
                                format_func=lambda x: {"cvd": "❤️ Cardiovascular", "dm": "🩸 Diabetes", "copd": "🫁 COPD"}[x])
     clf = models[disease_sel]
     x_input = inputs[disease_sel]
     prob = results[disease_sel]["prob"]
     tier = results[disease_sel]["tier"]
-
     st.markdown("Prediction: " + f"{prob*100:.1f}%" + " — Risk tier: " + RISK_EMOJIS[tier] + " " + tier)
-
     with st.spinner("Computing GGGA attributions..."):
         scores, gates, feat_names_disp = clf.ggga_explain(x_input.reshape(1, -1), patient_idx=0)
-
     col_ggga, col_gate = st.columns(2)
     with col_ggga:
         fig = plot_ggga_bars(scores, feat_names_disp, "GGGA Attribution — " + disease_sel.upper())
@@ -430,7 +532,6 @@ elif page == "🧠 XAI — Feature Attribution":
         fig2 = plot_gate_weights(gw, fns, disp, "DFIG Gate Weights — " + disease_sel.upper())
         st.pyplot(fig2, use_container_width=True)
         plt.close(fig2)
-
     st.markdown("#### Attribution Detail Table")
     df_attr = pd.DataFrame({
         "Feature": feat_names_disp,
@@ -462,7 +563,6 @@ elif page == "📊 Model Performance":
     df_metrics = pd.DataFrame(rows)
     st.dataframe(df_metrics.style.highlight_max(subset=["AUC-ROC", "F1 Score"], color="#1e3a1e"),
                  use_container_width=True)
-
     st.markdown("### AUC-ROC Comparison")
     fig, ax = plt.subplots(figsize=(10, 4))
     fig.patch.set_facecolor('#161b22')
@@ -482,7 +582,6 @@ elif page == "📊 Model Performance":
     plt.tight_layout()
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
-
     st.markdown("### DFIG Population-Level Gate Weights")
     for col, key in zip(st.columns(3), ["cvd", "dm", "copd"]):
         gw = np.array(meta[key]["gate_weights"])
@@ -491,9 +590,8 @@ elif page == "📊 Model Performance":
         fig = plot_gate_weights(gw, fns, disp, meta[key]["disease_name"])
         col.pyplot(fig, use_container_width=True)
         plt.close(fig)
-
     st.markdown("### Diagnostic Latency Reduction")
-    st.info("Validated latency reduction: 77.6% (target 20% or more confirmed). t-test vs standard clinical workflow: p < 0.001 over N=500 patients. Standard workflow mean approximately 37.5 min vs AI-assisted mean approximately 8.1 min.")
+    st.info("Validated latency reduction: 77.6% (target 20% or more confirmed). t-test vs standard clinical workflow: p < 0.001 over N=500 patients. Standard mean 37.5 min vs AI-assisted mean 8.1 min.")
 
 elif page == "ℹ️ About":
     st.title("ℹ️ About — Healthcare AI Co-pilot")
@@ -502,10 +600,10 @@ elif page == "ℹ️ About":
     st.markdown("""
 | Component | Description |
 |-----------|-------------|
-| DFIG — Dynamic Feature Importance Gate | Per-patient sigmoid gating with residual connection |
-| TRE — Temporal Risk Encoder | Age-conditioned sinusoidal embedding with disease-onset decay |
-| CRSL — Contrastive Risk Separation Loss | Cosine similarity separation monitor between class embeddings |
-| GGGA — Gate-Guided Gradient Attribution | gate times gradient times directional sign per feature |
+| DFIG Dynamic Feature Importance Gate | Per-patient sigmoid gating with residual connection |
+| TRE Temporal Risk Encoder | Age-conditioned sinusoidal embedding with disease-onset decay |
+| CRSL Contrastive Risk Separation Loss | Cosine similarity separation monitor between class embeddings |
+| GGGA Gate-Guided Gradient Attribution | gate times gradient times directional sign per feature |
     """)
     st.markdown("### Datasets")
     st.markdown("- Heart Disease — Cleveland, 1025 patients, 13 features")
