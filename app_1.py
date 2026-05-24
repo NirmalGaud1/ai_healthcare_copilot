@@ -264,13 +264,31 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════
 # MODEL LOADING  (cached — classes now defined above, pickle will work)
 # ══════════════════════════════════════════════════════════════════════
-MODEL_DIR = "models"
+
+# Always resolve models/ relative to THIS file, not the process working directory.
+# This is required for Streamlit Cloud where cwd != repo root.
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 @st.cache_resource(show_spinner="Loading MDRS-Net models…")
 def load_models():
     meta_path = os.path.join(MODEL_DIR, "copilot_meta.json")
+
+    # ── Debug info shown only when files are missing ──────────────────
     if not os.path.exists(meta_path):
-        return None, None, "❌ models/copilot_meta.json not found. Run the notebook first."
+        found = []
+        try:
+            found = os.listdir(MODEL_DIR) if os.path.isdir(MODEL_DIR) else ["(models/ folder missing)"]
+        except Exception:
+            found = ["(cannot list directory)"]
+        err = (
+            f"❌ `models/copilot_meta.json` not found.\n\n"
+            f"**Looking in:** `{MODEL_DIR}`\n\n"
+            f"**Files found there:** `{found}`\n\n"
+            "Make sure the `models/` folder (with all 5 files) is committed and "
+            "pushed to your GitHub repo at the **same level as `app.py`**."
+        )
+        return None, None, err
 
     with open(meta_path) as f:
         meta = json.load(f)
@@ -279,7 +297,11 @@ def load_models():
     for key in ["cvd", "dm", "copd"]:
         pkl_path = os.path.join(MODEL_DIR, f"mdrsnet_{key}.pkl")
         if not os.path.exists(pkl_path):
-            return None, None, f"❌ {pkl_path} not found. Run the save cell in the notebook first."
+            return None, None, (
+                f"❌ `models/mdrsnet_{key}.pkl` not found.\n\n"
+                f"**Looking in:** `{MODEL_DIR}`\n\n"
+                "Ensure all three `.pkl` files are pushed to GitHub."
+            )
         with open(pkl_path, "rb") as f:
             models[key] = pickle.load(f)
 
@@ -392,13 +414,33 @@ models, meta, error_msg = load_models()
 
 if error_msg:
     st.error(error_msg)
-    st.info("""
-**To generate model files:**
-1. Run the full MDRS-Net notebook on Kaggle / locally.
-2. Add and run `save_best_models_cell.py` (the provided save cell).
-3. Copy the `models/` folder next to `app.py`.
-4. Re-run `streamlit run app.py`.
-    """)
+    st.markdown("---")
+    st.markdown("### How to fix")
+    st.markdown(
+        "Your GitHub repo must have a **models/** folder at the same level as **app.py** "
+        "containing: mdrsnet_cvd.pkl, mdrsnet_dm.pkl, mdrsnet_copd.pkl, "
+        "copilot_meta.json, best_model_report.csv"
+    )
+    st.code(
+        "your-repo/
+"
+        "  app.py
+"
+        "  requirements.txt
+"
+        "  models/
+"
+        "    mdrsnet_cvd.pkl
+"
+        "    mdrsnet_dm.pkl
+"
+        "    mdrsnet_copd.pkl
+"
+        "    copilot_meta.json
+"
+        "    best_model_report.csv"
+    )
+    st.markdown(f"App is searching in: `{MODEL_DIR}`")
     st.stop()
 
 
