@@ -15,13 +15,12 @@ from sklearn.impute import SimpleImputer
 
 warnings.filterwarnings('ignore')
 
-
+# ====================== MODEL COMPONENTS ======================
 def dfig_gate(X, gate_weights):
     gates = 1.0 / (1.0 + np.exp(-np.abs(X) * gate_weights))
     gated = gates * X
     residual = X * gate_weights
     return gated + 0.3 * residual, gates
-
 
 def temporal_risk_encoding(age_values, hidden_dim=24):
     age_norm = np.clip(age_values, 1, 120) / 120.0
@@ -36,7 +35,6 @@ def temporal_risk_encoding(age_values, hidden_dim=24):
     cos_enc = cos_enc * decay[:, None]
     return np.hstack([sin_enc, cos_enc])
 
-
 def build_enriched_features(X_disease, gate_weights, age_col_idx=None,
                              X_age_raw=None, disease_name='cvd', tre_dim=24):
     gated, gates = dfig_gate(X_disease, gate_weights)
@@ -46,6 +44,7 @@ def build_enriched_features(X_disease, gate_weights, age_col_idx=None,
         tre = temporal_risk_encoding(X_disease[:, age_col_idx], hidden_dim=tre_dim)
     else:
         tre = np.zeros((len(X_disease), tre_dim))
+    
     if disease_name == 'cvd':
         interact = np.column_stack([
             X_disease[:, 0] * X_disease[:, 4],
@@ -72,29 +71,11 @@ def build_enriched_features(X_disease, gate_weights, age_col_idx=None,
         ])
     else:
         interact = X_disease[:, :5] * X_disease[:, 1:6]
+    
     enriched = np.hstack([gated, tre, interact])
     return enriched, gates
 
-
-class CRSLMonitor:
-    @staticmethod
-    def compute(X_enriched, y_labels, margin=1.0, sample_n=500):
-        np.random.seed(42)
-        idx = np.random.choice(len(X_enriched), min(sample_n, len(X_enriched)), replace=False)
-        X_sub = X_enriched[idx]
-        y_sub = y_labels[idx]
-        norms = np.linalg.norm(X_sub, axis=1, keepdims=True).clip(1e-8)
-        X_norm = X_sub / norms
-        sim = X_norm @ X_norm.T
-        same = y_sub[:, None] == y_sub[None, :]
-        np.fill_diagonal(same, False)
-        diff = ~same.copy()
-        np.fill_diagonal(diff, False)
-        sim_same = sim[same].mean() if same.any() else 0.0
-        sim_diff = sim[diff].mean() if diff.any() else 0.0
-        return sim_same, sim_diff, sim_same - sim_diff
-
-
+# ====================== CLASSES ======================
 class MDRSNetPerDisease:
     def __init__(self, disease_name, feature_names, display_names=None,
                  hidden=(128, 64), alpha=1e-2, tre_dim=24):
@@ -111,8 +92,6 @@ class MDRSNetPerDisease:
         self.scaler = StandardScaler()
         self.gate_weights = None
         self.age_col_idx = None
-        self._X_enriched = None
-        self._gates = None
 
     def _find_age_col(self):
         for i, f in enumerate(self.feature_names):
@@ -132,9 +111,6 @@ class MDRSNetPerDisease:
         X_en, gates = build_enriched_features(
             X_sc, self.gate_weights, self.age_col_idx,
             disease_name=self.disease_name, tre_dim=self.tre_dim)
-        self._X_enriched = X_en
-        self._gates = gates
-        CRSLMonitor.compute(X_en, y)
         self.model.fit(X_en, y)
         return self
 
@@ -167,29 +143,7 @@ class MDRSNetPerDisease:
         display = [self.display_names.get(f, f) for f in self.feature_names]
         return scores, gate_p, display
 
-
-class MDRSNetCopilot:
-    DISEASE_KEYS = ['cvd', 'dm', 'copd']
-
-    def __init__(self):
-        self.models = {}
-
-    def assess_patient(self, x_cvd, x_dm, x_copd):
-        probs = {}
-        for key, x in zip(self.DISEASE_KEYS, [x_cvd, x_dm, x_copd]):
-            p, _ = self.models[key].predict_proba(x.reshape(1, -1))
-            probs[key] = float(p[0])
-        tiers = {}
-        for key, p in probs.items():
-            if p > 0.70:
-                tiers[key] = 'HIGH'
-            elif p > 0.40:
-                tiers[key] = 'MEDIUM'
-            else:
-                tiers[key] = 'LOW'
-        return probs, tiers
-
-
+# ====================== STREAMLIT APP ======================
 st.set_page_config(
     page_title="Healthcare AI Co-pilot | MDRS-Net",
     page_icon="🏥",
@@ -206,164 +160,72 @@ st.markdown("""
     padding: 16px 20px; margin: 6px 0;
     border-left: 4px solid;
 }
-.risk-HIGH   { border-color: #ff4444; background: #2d0f0f; }
+.risk-HIGH { border-color: #ff4444; background: #2d0f0f; }
 .risk-MEDIUM { border-color: #ffa500; background: #2d1f00; }
-.risk-LOW    { border-color: #44ff88; background: #0f2d1a; }
+.risk-LOW { border-color: #44ff88; background: #0f2d1a; }
 .section-title { font-size: 1.15rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.4rem; }
-.stButton > button {
-    background: #238636; color: white; border-radius: 8px;
-    border: none; font-weight: 600; font-size: 1rem; padding: 0.55rem 1.8rem;
-}
-.stButton > button:hover { background: #2ea043; }
-footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
+# === FIXED MODEL PATH ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "models")
+MODEL_DIR = BASE_DIR  # Models are in root, not in 'models/' folder
 
 RISK_COLORS = {"HIGH": "#ff4444", "MEDIUM": "#ffa500", "LOW": "#44ff88"}
 RISK_EMOJIS = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
 
-
 def risk_tier(prob):
-    if prob > 0.70:
-        return "HIGH"
-    if prob > 0.40:
-        return "MEDIUM"
+    if prob > 0.70: return "HIGH"
+    if prob > 0.40: return "MEDIUM"
     return "LOW"
-
 
 def render_risk_card(disease, prob, tier, col):
     col.markdown(
-        '<div class="metric-card risk-' + tier + '">'
-        '<div style="font-size:.85rem;color:#8b949e;">' + disease + '</div>'
-        '<div style="font-size:2rem;font-weight:700;color:' + RISK_COLORS[tier] + ';">' + f'{prob*100:.1f}%' + '</div>'
-        '<div style="font-size:1rem;color:' + RISK_COLORS[tier] + ';">' + RISK_EMOJIS[tier] + ' ' + tier + ' RISK</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-
-def plot_gauge(prob, label, color):
-    fig, ax = plt.subplots(figsize=(3.2, 2.0), subplot_kw=dict(aspect='equal'))
-    fig.patch.set_alpha(0)
-    ax.set_facecolor('none')
-    theta = np.linspace(np.pi, 0, 200)
-    ax.plot(np.cos(theta), np.sin(theta), color='#30363d', lw=12, solid_capstyle='round')
-    end = max(1, int(prob * 200))
-    ax.plot(np.cos(theta[:end]), np.sin(theta[:end]), color=color, lw=12, solid_capstyle='round')
-    ax.text(0, -0.35, f"{prob*100:.1f}%", ha='center', va='center',
-            fontsize=15, fontweight='bold', color=color)
-    ax.text(0, -0.65, label, ha='center', va='center', fontsize=8, color='#8b949e')
-    ax.set_xlim(-1.2, 1.2)
-    ax.set_ylim(-0.8, 1.2)
-    ax.axis('off')
-    plt.tight_layout(pad=0.2)
-    return fig
-
-
-def plot_ggga_bars(scores, feat_names, title, top_n=10):
-    idx = np.argsort(np.abs(scores))[-top_n:][::-1]
-    vals = scores[idx]
-    names = [feat_names[i][:22] for i in idx]
-    colors = ['#ff4444' if v > 0 else '#4ecdc4' for v in vals]
-    fig, ax = plt.subplots(figsize=(6, max(3, len(idx) * 0.45)))
-    fig.patch.set_facecolor('#161b22')
-    ax.set_facecolor('#161b22')
-    ax.barh(range(len(vals))[::-1], vals, color=colors, alpha=0.85)
-    ax.set_yticks(range(len(names))[::-1])
-    ax.set_yticklabels(names, color='#e6edf3', fontsize=9)
-    ax.axvline(0, color='#8b949e', lw=0.8, linestyle='--')
-    ax.set_xlabel('GGGA Attribution Score', color='#8b949e', fontsize=9)
-    ax.set_title(title, color='#e6edf3', fontsize=11, fontweight='bold')
-    ax.tick_params(colors='#8b949e')
-    for sp in ax.spines.values():
-        sp.set_edgecolor('#30363d')
-    plt.tight_layout()
-    return fig
-
-
-def plot_gate_weights(gate_weights, feat_names, display_names, title, top_n=12):
-    idx = np.argsort(gate_weights)[-top_n:]
-    vals = gate_weights[idx]
-    names = [display_names.get(feat_names[i], feat_names[i])[:20] for i in idx]
-    norm = vals / vals.max() if vals.max() > 0 else vals
-    fig, ax = plt.subplots(figsize=(6, max(3, len(idx) * 0.42)))
-    fig.patch.set_facecolor('#161b22')
-    ax.set_facecolor('#161b22')
-    ax.barh(range(len(vals)), vals, color=plt.cm.YlOrRd(norm), alpha=0.88)
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, color='#e6edf3', fontsize=9)
-    ax.set_xlabel('Gate Weight', color='#8b949e', fontsize=9)
-    ax.set_title(title, color='#e6edf3', fontsize=11, fontweight='bold')
-    ax.tick_params(colors='#8b949e')
-    for sp in ax.spines.values():
-        sp.set_edgecolor('#30363d')
-    plt.tight_layout()
-    return fig
-
+        f'<div class="metric-card risk-{tier}">'
+        f'<div style="font-size:.85rem;color:#8b949e;">{disease}</div>'
+        f'<div style="font-size:2rem;font-weight:700;color:{RISK_COLORS[tier]};">{prob*100:.1f}%</div>'
+        f'<div style="font-size:1rem;color:{RISK_COLORS[tier]};">{RISK_EMOJIS[tier]} {tier} RISK</div>'
+        '</div>', unsafe_allow_html=True)
 
 @st.cache_resource(show_spinner="Loading MDRS-Net models...")
 def load_models():
-    meta_path = os.path.join(MODEL_DIR, "copilot_meta.json")
+    meta_path = os.path.join(BASE_DIR, "copilot_meta.json")
+    
     if not os.path.exists(meta_path):
-        files_found = []
-        if os.path.isdir(MODEL_DIR):
-            files_found = os.listdir(MODEL_DIR)
-        return None, None, "NOT_FOUND", files_found
+        st.error("❌ `copilot_meta.json` not found in root directory.")
+        st.info(f"Files found: {os.listdir(BASE_DIR)}")
+        return None, None, "NOT_FOUND", os.listdir(BASE_DIR)
+    
     with open(meta_path) as f:
         meta = json.load(f)
+    
     models = {}
     for key in ["cvd", "dm", "copd"]:
-        pkl_path = os.path.join(MODEL_DIR, f"mdrsnet_{key}.pkl")
+        pkl_path = os.path.join(BASE_DIR, f"mdrsnet_{key}.pkl")
         if not os.path.exists(pkl_path):
+            st.error(f"❌ `mdrsnet_{key}.pkl` not found!")
             return None, None, f"MISSING_{key}", []
+        
         with open(pkl_path, "rb") as f:
             models[key] = pickle.load(f)
+    
     return models, meta, "OK", []
 
-
+# ====================== SIDEBAR ======================
 with st.sidebar:
     st.markdown("## 🏥 Healthcare AI Co-pilot")
     st.markdown("**MDRS-Net** — Multi-Disease Risk Stratification")
     st.markdown("---")
     page = st.radio("Navigation", [
-        "🏠 Home",
-        "🔬 Patient Risk Assessment",
-        "🧠 XAI — Feature Attribution",
-        "📊 Model Performance",
-        "ℹ️ About",
+        "🏠 Home", "🔬 Patient Risk Assessment",
+        "🧠 XAI — Feature Attribution", "📊 Model Performance", "ℹ️ About"
     ], label_visibility="collapsed")
-    st.markdown("---")
-    st.markdown("**Novel Components**")
-    st.markdown("- 🔵 DFIG — Dynamic Feature Gate")
-    st.markdown("- 🟣 TRE — Temporal Risk Encoder")
-    st.markdown("- 🟠 CRSL — Contrastive Loss Monitor")
-    st.markdown("- 🟢 GGGA — Gate-Guided Attribution")
-    st.markdown("---")
-    st.caption("Datasets: Heart Disease · Diabetes BRFSS 2015 · COPD Dataset")
 
 models, meta, status, files_found = load_models()
 
 if status != "OK":
-    if status == "NOT_FOUND":
-        st.error("models/copilot_meta.json not found.")
-        st.markdown("**App is looking in:** " + MODEL_DIR)
-        st.markdown("**Files found in models/ folder:** " + str(files_found) if files_found else "models/ folder is missing or empty.")
-    else:
-        key = status.replace("MISSING_", "")
-        st.error("mdrsnet_" + key + ".pkl not found in models/ folder.")
-    st.markdown("---")
-    st.markdown("### How to fix")
-    st.markdown("Your GitHub repo must have this structure:")
-    st.code("your-repo/\n  app.py\n  requirements.txt\n  models/\n    mdrsnet_cvd.pkl\n    mdrsnet_dm.pkl\n    mdrsnet_copd.pkl\n    copilot_meta.json\n    best_model_report.csv")
-    st.markdown("1. Run the MDRS-Net notebook on Kaggle.")
-    st.markdown("2. Run the save_best_models_cell.py cell.")
-    st.markdown("3. Download the models/ folder from Kaggle Output tab.")
-    st.markdown("4. Upload all files inside models/ to your GitHub repo under a models/ folder.")
-    st.markdown("5. Redeploy on Streamlit Cloud.")
     st.stop()
+
 
 if page == "🏠 Home":
     st.title("Healthcare AI Co-pilot")
